@@ -1,0 +1,51 @@
+{
+  "algorithms": [],
+  "default_scenario": "slot-3",
+  "env_id": "overcooked-739950a-single-order-v1",
+  "experiment_id": 2,
+  "experiment_revision": 6,
+  "kind": "team",
+  "scenarios": [
+    {
+      "id": "slot-3",
+      "title": "非对称协作",
+      "scenario": {
+        "layout_id": "unident_s_hard",
+        "onion": 3,
+        "tomato": 0,
+        "horizon": 400,
+        "cook_time": 20,
+        "reward": 20
+      },
+      "scenario_spec_id": "dcf6681486e13e0ac94714dce2e4411cfaa45a96802ebcc115d8de119daef0e5"
+    },
+    {
+      "id": "slot-4",
+      "title": "柜台环路",
+      "scenario": {
+        "layout_id": "counter_circuit",
+        "onion": 3,
+        "tomato": 0,
+        "horizon": 400,
+        "cook_time": 20,
+        "reward": 20
+      },
+      "scenario_spec_id": "cb07ccecfa0862284f13313425309c50c2af521aeefbe0983548542887ef2155"
+    },
+    {
+      "id": "slot-5",
+      "title": "对称厨房",
+      "scenario": {
+        "layout_id": "schelling",
+        "onion": 3,
+        "tomato": 0,
+        "horizon": 400,
+        "cook_time": 20,
+        "reward": 20
+      },
+      "scenario_spec_id": "68e1e3c6e0c78a8ad8ff9008c8686439eff811870a6125789d2caa6018c3546c"
+    }
+  ],
+  "submission_max_bytes": 5242880,
+  "teaching_code_access": "interface"
+}

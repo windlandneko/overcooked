@@ -1,0 +1,38 @@
+{
+  "algorithms": [],
+  "default_scenario": "slot-1",
+  "env_id": "overcooked-739950a-single-order-v1",
+  "experiment_id": 1,
+  "experiment_revision": 4,
+  "kind": "personal",
+  "scenarios": [
+    {
+      "id": "slot-1",
+      "scenario": {
+        "cook_time": 20,
+        "horizon": 400,
+        "layout_id": "large_room",
+        "onion": 3,
+        "reward": 20,
+        "tomato": 0
+      },
+      "scenario_spec_id": "3ed941275d79b0c8ac8d6299f8acf9633cf2b2585b987b1d31ec4f7fd9cd37eb",
+      "title": "宽敞厨房"
+    },
+    {
+      "id": "slot-2",
+      "scenario": {
+        "cook_time": 20,
+        "horizon": 400,
+        "layout_id": "asymmetric_advantages_tomato",
+        "onion": 1,
+        "reward": 20,
+        "tomato": 2
+      },
+      "scenario_spec_id": "aa35eddcbb199011433821cad3d0ea547c710663552298f2b84b62023bf0e8c5",
+      "title": "非对称优势 · 番茄"
+    }
+  ],
+  "submission_max_bytes": 5242880,
+  "teaching_code_access": "interface"
+}
