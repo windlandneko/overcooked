@@ -575,9 +575,10 @@ def train_map(
         return greedy, upd
 
     # Per-environment partner, seat, flip and mode, redrawn only when that environment's episode ends.
+    seat1_prob = 0.60 if layout_id == "unident_s_hard" else 0.50  # asymmetric green seat learns slower
     env_pids = sample_partners(num_envs)
     env_pids_t = torch.from_numpy(env_pids).to(dev)
-    seats_np = rng.integers(0, 2, size=num_envs, dtype=np.int64)
+    seats_np = (rng.random(num_envs) < seat1_prob).astype(np.int64)
     seats_t = torch.from_numpy(seats_np).to(dev)
     flip = (torch.randint(0, 2, (num_envs,), dtype=torch.bool, device=dev) if other_play
             else torch.zeros(num_envs, dtype=torch.bool, device=dev))
@@ -654,7 +655,7 @@ def train_map(
                           buffer(dtype=long), buffer(dtype=long), buffer(dtype=long), buffer(PrivilegedCriticNet.PRIV_DIM), buffer())))
     val_buf, rew_buf, done_buf = buffer(), buffer(), buffer()
 
-    state_aug_end = min(0.15, state_aug_prob)
+    state_aug_end = min(0.10, state_aug_prob)
     assert rollout_steps % chunk_len == 0, "rollout_steps must be divisible by chunk_len"
     num_chunks = rollout_steps // chunk_len
     total_seqs = num_chunks * num_envs
@@ -826,7 +827,7 @@ def train_map(
 
                     env_pids[done_np] = sample_partners(n_done)
                     env_pids_t = torch.from_numpy(env_pids).to(dev)
-                    seats_np[done_np] = rng.integers(0, 2, size=n_done, dtype=np.int64)
+                    seats_np[done_np] = (rng.random(n_done) < seat1_prob).astype(np.int64)
                     seats_t = torch.from_numpy(seats_np).to(dev)
                     if other_play:
                         flip[done_t] = torch.randint(0, 2, (n_done,), dtype=torch.bool, device=dev)
@@ -893,7 +894,8 @@ def train_map(
                 nn.utils.clip_grad_norm_(params, 0.5)
                 opt.step()
 
-        if update % eval_every == 0 or update == num_updates:
+        cur_eval_every = max(1, eval_every // 2) if update >= int(0.70 * num_updates) else eval_every
+        if update % cur_eval_every == 0 or update == num_updates:
             _save_weights(student, latest_path)
             if holdout_pool:
                 holdout = evaluate_against_pool(student, layout_id, holdout_pool, dev, episodes_per_partner=4,
@@ -990,23 +992,23 @@ def main() -> None:
     parser.add_argument("--rollout-steps", type=int, default=80)
     parser.add_argument("--chunk-len", type=int, default=40)
     parser.add_argument("--minibatches", type=int, default=4)
-    parser.add_argument("--steps-per-map", type=int, default=120_000_000)
+    parser.add_argument("--steps-per-map", type=int, default=None, help="override steps for all maps (default: schelling=160M, others=120M)")
     parser.add_argument("--hidden-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=4e-4)
     parser.add_argument("--clip-coef", type=float, default=0.2)
-    parser.add_argument("--ent-coef-start", type=float, default=0.025)
-    parser.add_argument("--ent-coef-end", type=float, default=0.005)
+    parser.add_argument("--ent-coef-start", type=float, default=0.02)
+    parser.add_argument("--ent-coef-end", type=float, default=0.003)
     parser.add_argument("--shaping-start", type=float, default=0.4, help="shaped-reward weight, decays to 0 at 2/3 of training")
     parser.add_argument("--collision-penalty", type=float, default=0.05)
     parser.add_argument("--partner-aux-coef", type=float, default=0.25)
-    parser.add_argument("--state-aug-prob", type=float, default=0.4)
+    parser.add_argument("--state-aug-prob", type=float, default=0.35)
     parser.add_argument("--critic-warmup-updates", type=int, default=0)
-    parser.add_argument("--teacher-share", type=float, default=0.45, help="share of the 0.72 pool draws for teachers")
+    parser.add_argument("--teacher-share", type=float, default=0.40, help="share of the 0.72 pool draws for teachers")
     parser.add_argument("--teacher-greedy-prob", type=float, default=0.15)
     parser.add_argument("--teacher-upd-prob", type=float, default=0.15)
-    parser.add_argument("--classmate-share", type=float, default=0.25, help="share of the 0.72 pool draws for classmates")
+    parser.add_argument("--classmate-share", type=float, default=0.20, help="share of the 0.72 pool draws for classmates")
     parser.add_argument("--classmate-weight", type=float, default=0.5, help="weight of classmate dev in the selection")
-    parser.add_argument("--min-partner-sp", type=float, default=0.0, help="drop population styles below this self-play")
+    parser.add_argument("--min-partner-sp", type=float, default=20.0, help="drop population styles below this self-play")
     parser.add_argument("--eval-every", type=int, default=40)
     parser.add_argument("--dev-episodes", type=int, default=8, help="per dev member and seat at each evaluation")
     parser.add_argument("--final-dev-episodes", type=int, default=24, help="per dev member and seat for the final choice")
@@ -1014,8 +1016,11 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = vars(parser.parse_args())
+    default_steps = {"counter_circuit": 120_000_000, "schelling": 160_000_000, "unident_s_hard": 120_000_000}
+    override_steps = args.pop("steps_per_map")
     for layout_id in args.pop("layouts"):
-        train_map(layout_id, **args)
+        steps = override_steps if override_steps is not None else default_steps.get(layout_id, 120_000_000)
+        train_map(layout_id, steps_per_map=steps, **args)
 
 
 if __name__ == "__main__":

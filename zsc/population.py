@@ -72,8 +72,8 @@ def default_styles() -> list[Style]:
         return tuple(float(kw.get(k, 0.0)) for k in EVENTS)
 
     base = vec(pot_onion=3.0, start_cook=2.0, dish_pickup=2.0, soup_pickup=4.0, collision=-0.05)
-    cw_v = vec(pot_onion=3.0, start_cook=2.0, dish_pickup=2.0, soup_pickup=4.0, collision=-0.05, curl=0.15)
-    ccw_v = vec(pot_onion=3.0, start_cook=2.0, dish_pickup=2.0, soup_pickup=4.0, collision=-0.05, curl=-0.15)
+    cw_v = vec(pot_onion=3.0, start_cook=2.0, dish_pickup=2.0, soup_pickup=4.0, collision=-0.05, curl=0.03)
+    ccw_v = vec(pot_onion=3.0, start_cook=2.0, dish_pickup=2.0, soup_pickup=4.0, collision=-0.05, curl=-0.03)
     relay_a = vec(pot_onion=1.0, drop_onion=3.5, soup_deliver=2.0, collision=-0.05, zone=-0.5)
     relay_b = vec(pot_onion=3.5, handoff_pickup=3.5, start_cook=3.0, soup_pickup=4.0, drop_soup=2.5, zone=0.5)
     zone_top = vec(pot_onion=3.0, start_cook=2.0, dish_pickup=2.0, soup_pickup=4.0, collision=-0.05, zone=-1.5)
@@ -84,9 +84,9 @@ def default_styles() -> list[Style]:
     plater_only = vec(dish_pickup=4.0, soup_pickup=6.0, soup_deliver=4.0, handoff_pickup=2.0, collision=-0.05)
     cautious_sp = vec(pot_onion=1.5, start_cook=1.0, soup_pickup=2.0, collision=-0.5)
 
-    ho_cw_a = vec(pot_onion=2.0, drop_onion=3.0, soup_deliver=3.0, curl=0.15, collision=-0.05)
-    ho_cw_b = vec(pot_onion=3.0, handoff_pickup=3.0, start_cook=3.0, soup_pickup=5.0, curl=0.15)
-    ho_ccw_rush = vec(pot_onion=3.0, start_cook=3.0, dish_pickup=2.0, soup_pickup=5.0, curl=-0.20, collision=0.0)
+    ho_cw_a = vec(pot_onion=2.0, drop_onion=3.0, soup_deliver=3.0, curl=0.03, collision=-0.05)
+    ho_cw_b = vec(pot_onion=3.0, handoff_pickup=3.0, start_cook=3.0, soup_pickup=5.0, curl=0.03)
+    ho_ccw_rush = vec(pot_onion=3.0, start_cook=3.0, dish_pickup=2.0, soup_pickup=5.0, curl=-0.04, collision=0.0)
     ho_spot_a = vec(pot_onion=3.5, start_cook=3.0, soup_pickup=5.0, drop_soup=3.5, zone=-1.0)
     ho_spot_b = vec(pot_onion=2.0, drop_onion=2.5, handoff_pickup=3.0, soup_deliver=5.0, zone=-0.5)
     ho_pure = vec(pot_onion=0.5, start_cook=0.5, soup_pickup=1.0, collision=-0.02)
@@ -232,8 +232,8 @@ def train_family(
             xp_shift = 1 + ((update // 5) % max(1, n_train - 1))
         # Once the ring holds cross-play states, 20% of restarts begin mid-game.
         aug = 0.20 if n_xp and env.ring_size >= 256 else 0.0
-        if cnn:  # the shaping decays to 0 over the first 75% of updates
-            shaping_scale = max(0.0, 1.0 - update / max(1.0, 0.75 * num_updates))
+        if cnn:  # decay shaping over the first 75% of updates, keeping a 0.15 floor to preserve style diversity
+            shaping_scale = max(0.15, 1.0 - 0.85 * update / max(1.0, 0.75 * num_updates))
             sp_ready = torch.from_numpy((sp_score > 80.0).astype(np.float32)).to(dev)
         else:
             mult = torch.where(anneal, shaping * max(0.0, 1.0 - update / max(1.0, 0.70 * num_updates)), shaping)
