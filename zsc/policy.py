@@ -3,13 +3,11 @@ package as policy.py, so it imports nothing from this repository.
 
 The network reads the grid (CoordConv into three SE residual blocks), its own and the partner's previous action,
 its seat and the time left, and keeps a two-layer GRU memory. A partner head predicts the partner's next action
-under 12 partner types; a Bayesian belief over those types, updated from the partner's actual moves, mixes the
-predictions and the type-specific corrections of the action logits.
+and feeds its predicted distribution into the actor head.
 """
 
 from __future__ import annotations
 
-import json
 import math
 from pathlib import Path
 
@@ -19,7 +17,6 @@ from safetensors.torch import load_file
 from torch import nn
 
 MAX_H, MAX_W = 7, 9  # every map is zero-padded to this size
-NUM_TYPES = 12
 START = 6  # previous-action token at an episode start
 
 
@@ -52,29 +49,6 @@ def init_orthogonal(module: nn.Module, gain: float) -> None:
                     nn.init.zeros_(param)
 
 
-def update_belief(
-    belief: torch.Tensor,
-    prev_partner: torch.Tensor,
-    prev_logits: torch.Tensor | None,
-    eta: float = 1.0,
-    share: float = 0.05,
-) -> torch.Tensor:
-    """Fixed-share Bayes step: weight each type by how well it predicted the partner's last action.
-
-    `eta` tempers the likelihood and `share` mixes back a little uniform mass so the belief can follow a
-    partner that changes its style mid-game. At an episode start there is no prediction yet: uniform.
-    """
-    k = belief.shape[-1]
-    uniform = belief.new_full(belief.shape, 1.0 / k)
-    if prev_logits is None:
-        return uniform
-    valid = prev_partner < START
-    log_probs = torch.log_softmax(prev_logits.float(), dim=-1)  # (B, K, 6)
-    log_like = log_probs.gather(-1, prev_partner.clamp(0, 5).view(-1, 1, 1).expand(-1, k, 1)).squeeze(-1)
-    posterior = torch.softmax(torch.log(belief.float().clamp_min(1e-12)) + eta * log_like, dim=-1)
-    return torch.where(valid.unsqueeze(-1), (1.0 - share) * posterior + share / k, uniform)
-
-
 class SEResBlock(nn.Module):
     def __init__(self, channels: int = 64, groups: int = 8, se_hidden: int = 16):
         super().__init__()
@@ -89,19 +63,17 @@ class SEResBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.act(self.gn1(self.conv1(x)))
         h = self.gn2(self.conv2(h))
-        se = torch.sigmoid(self.se_fc2(self.act(self.se_fc1(h.mean(dim=(-2, -1), keepdim=True)))))
-        return self.act(x + h * se)
+        # 1D reduction and 3D multiply avoid a slow 2D-mean / 4D-broadcast path on MPS.
+        pooled = h.flatten(-2).mean(dim=-1, keepdim=True).unsqueeze(-1)
+        se = torch.sigmoid(self.se_fc2(self.act(self.se_fc1(pooled)))).squeeze(-1)
+        return self.act(x + (h.flatten(-2) * se).view_as(h))
 
 
 class ZSCStudentNet(nn.Module):
-    def __init__(self, hidden: int = 256, num_archetypes: int = NUM_TYPES, belief_eta: float = 1.0,
-                 belief_gamma: float = 0.05):
+    def __init__(self, hidden: int = 256):
         super().__init__()
         self.hidden_size = hidden
         self.num_layers = 2
-        self.num_archetypes = num_archetypes
-        self.belief_eta = belief_eta
-        self.belief_gamma = belief_gamma
         self.register_buffer("_coord_grid", coord_grid(), persistent=False)
 
         self.stem = nn.Sequential(nn.Conv2d(28, 64, kernel_size=3, padding=1, bias=False), nn.GroupNorm(8, 64), nn.SiLU())
@@ -122,9 +94,8 @@ class ZSCStudentNet(nn.Module):
         self.memory_norm = nn.LayerNorm(hidden)
 
         head_dim = max(64, hidden // 2)
-        self.partner_head = nn.Linear(hidden, num_archetypes * 6)
-        self.actor = nn.Sequential(nn.Linear(hidden + num_archetypes + 6, head_dim), nn.SiLU(), nn.Linear(head_dim, 6))
-        self.actor_moe = nn.Linear(hidden, num_archetypes * 6)  # per-type corrections of the action logits
+        self.partner_head = nn.Linear(hidden, 6)
+        self.actor = nn.Sequential(nn.Linear(hidden + 6, head_dim), nn.SiLU(), nn.Linear(head_dim, 6))
 
         init_orthogonal(self.stem, math.sqrt(2.0))
         init_orthogonal(self.res_blocks, math.sqrt(2.0))
@@ -133,8 +104,6 @@ class ZSCStudentNet(nn.Module):
         init_orthogonal(self.partner_head, 1.0)
         init_orthogonal(self.actor[0], math.sqrt(2.0))
         init_orthogonal(self.actor[-1], 0.01)
-        nn.init.zeros_(self.actor_moe.weight)  # starts as a plain actor; the corrections are learned
-        nn.init.zeros_(self.actor_moe.bias)
 
     def encode_spatial(self, grid: torch.Tensor) -> torch.Tensor:
         """(N, 26, H, W) -> (N, hidden)."""
@@ -149,15 +118,14 @@ class ZSCStudentNet(nn.Module):
         prev_partner: torch.Tensor,  # (B, T) int64, START at an episode start
         seat: torch.Tensor,          # (B, T)
         time_left: torch.Tensor,     # (B, T), 1 at the start and 0 at the horizon
-        hidden: torch.Tensor | None = None,               # (2, B, hidden)
-        belief: torch.Tensor | None = None,               # (B, K)
-        prev_partner_logits: torch.Tensor | None = None,  # (B, K, 6)
+        hidden: torch.Tensor | None = None,  # (2, B, hidden)
         return_features: bool = False,
     ):
         b, t = grid.shape[:2]
         feat = self.encode_spatial(grid.reshape(b * t, *grid.shape[2:])).reshape(b, t, -1)
-        meta = torch.stack((seat, time_left), dim=-1)
-        x = torch.cat((feat, self.prev_self(prev_self), self.prev_partner(prev_partner), meta), dim=-1)
+        meta = torch.stack((seat, time_left), dim=-1).to(dtype=feat.dtype)
+        x = torch.cat((feat, self.prev_self(prev_self).to(dtype=feat.dtype),
+                       self.prev_partner(prev_partner).to(dtype=feat.dtype), meta), dim=-1)
 
         # Training sequences can span an episode boundary: zero the memory wherever an episode starts.
         if t == 1:
@@ -166,36 +134,29 @@ class ZSCStudentNet(nn.Module):
             out, hidden = self.memory(x, hidden)
         else:
             h = hidden if hidden is not None else x.new_zeros((self.num_layers, b, self.hidden_size))
-            outs = []
-            for step in range(t):
-                h = h * (prev_self[:, step] != START).to(dtype=h.dtype).view(1, b, 1)
-                out_s, h = self.memory(x[:, step : step + 1], h)
-                outs.append(out_s)
-            out, hidden = torch.cat(outs, dim=1), h
+            resets = (prev_self == START).any(dim=0).nonzero(as_tuple=False).flatten().tolist()
+            if not resets:
+                out, hidden = self.memory(x, h)
+            else:
+                outs, start = [], 0
+                for step in resets:
+                    if step > start:
+                        chunk, h = self.memory(x[:, start:step], h)
+                        outs.append(chunk)
+                    h = h * (prev_self[:, step] != START).to(dtype=h.dtype).view(1, b, 1)
+                    start = step
+                chunk, h = self.memory(x[:, start:], h)
+                outs.append(chunk)
+                out, hidden = torch.cat(outs, dim=1), h
 
         out = self.memory_norm(out)
-        partner_logits = self.partner_head(out).reshape(b, t, self.num_archetypes, 6)
-
-        with torch.no_grad():
-            w = belief.float() if belief is not None else out.new_full((b, self.num_archetypes), 1.0 / self.num_archetypes,
-                                                                        dtype=torch.float32)
-            beliefs, prev_logits = [], prev_partner_logits
-            for step in range(t):
-                w = update_belief(w, prev_partner[:, step], prev_logits, eta=self.belief_eta, share=self.belief_gamma)
-                beliefs.append(w)
-                prev_logits = partner_logits[:, step].detach()
-            beliefs = torch.stack(beliefs, dim=1)
-
-        p_probs = torch.softmax(partner_logits.float(), dim=-1)  # (B, T, K, 6)
-        predicted_partner = (beliefs.unsqueeze(-1) * p_probs).sum(dim=-2).detach().to(dtype=out.dtype)
-        weights = beliefs.to(dtype=out.dtype)
-        base_logits = self.actor(torch.cat((out, weights, predicted_partner), dim=-1))
-        corrections = self.actor_moe(out).reshape(b, t, self.num_archetypes, 6)
-        logits = base_logits + (weights.unsqueeze(-1) * corrections).sum(dim=-2)
+        partner_logits = self.partner_head(out)
+        predicted_partner = torch.softmax(partner_logits.float(), dim=-1).detach().to(dtype=out.dtype)
+        logits = self.actor(torch.cat((out, predicted_partner), dim=-1))
 
         if return_features:
-            return logits, partner_logits, out, hidden, w
-        return logits, partner_logits, hidden, w
+            return logits, partner_logits, out, hidden
+        return logits, partner_logits, hidden
 
 
 def load_weights(path: Path) -> dict[str, torch.Tensor]:
@@ -209,79 +170,35 @@ def load_weights(path: Path) -> dict[str, torch.Tensor]:
 
 
 class Policy:
-    """The course interface. `meta.json` maps each map to its belief `eta` and sampling `temperature` (0: argmax)."""
+    """The course interface: loads one `<layout>.safetensors` network per map and acts greedily."""
 
     def __init__(self, model_dir: str | Path, device: str = "cpu"):  # the course's signature; runs on the CPU
         torch.set_num_threads(1)
         root = Path(model_dir)
-        meta = json.loads((root / "meta.json").read_text())
-        self.temperatures = {layout: m["temperature"] for layout, m in meta.items()}
         self.models = {}
-        for layout, m in meta.items():
-            net = ZSCStudentNet(belief_eta=m["eta"])
-            net.load_state_dict(load_weights(root / f"{layout}.safetensors"))
-            self.models[layout] = net.eval().requires_grad_(False)
+        for path in sorted(root.glob("*.safetensors")):
+            net = ZSCStudentNet()
+            net.load_state_dict(load_weights(path))
+            self.models[path.stem] = net.eval().requires_grad_(False)
         self.reset(seed=0, player_index=0, layout_id=None, scenario_spec_id=None)
 
     def reset(self, *, seed, player_index, layout_id, scenario_spec_id):
-        self.rng = np.random.default_rng(seed + 17 * player_index)
-        self.clear_memory()
-
-    def clear_memory(self) -> None:
-        self.hidden = self.belief = self.prev_partner_logits = self.last_grid = None
-        self.step_count = 0
-        self.last_action = START
-
-    @staticmethod
-    def partner_action_from_grids(old: np.ndarray, new: np.ndarray) -> int:
-        """The partner's last action read off two consecutive grids, for platforms that do not pass
-        `previous_joint_action`: a move or turn names the direction, a change of the partner's held item or of
-        the tile it faces means interact, otherwise stay. Channel 1 is the partner's cell, 6-9 its facing."""
-        y0, x0 = np.argwhere(old[1] > 0)[0]
-        y1, x1 = np.argwhere(new[1] > 0)[0]
-        moves = {(-1, 0): 0, (1, 0): 1, (0, 1): 2, (0, -1): 3}
-        if (int(y1 - y0), int(x1 - x0)) in moves:
-            return moves[int(y1 - y0), int(x1 - x0)]
-        facing_old, facing_new = int(old[6:10, y0, x0].argmax()), int(new[6:10, y1, x1].argmax())
-        if facing_new != facing_old:
-            return facing_new
-        fy, fx = y1 + (-1, 1, 0, 0)[facing_new], x1 + (0, 0, 1, -1)[facing_new]
-        held, placed = [18, 19, 21, 22, 23, 24], [16, 17, 22, 23, 24]
-        if not np.array_equal(old[held, y1, x1], new[held, y1, x1]):
-            return 5
-        if 0 <= fy < new.shape[1] and 0 <= fx < new.shape[2] and not np.array_equal(old[placed, fy, fx],
-                                                                                     new[placed, fy, fx]):
-            return 5
-        return 4
+        self.hidden = None
 
     def act(self, observation: dict) -> int:
         layout, seat, timestep = observation["layout_id"], observation["player_index"], observation["timestep"]
-        grid = np.array(observation["grid"], dtype=np.float32)
-        # The memory is cleared only when an episode starts, never because `previous_joint_action` is missing.
-        if timestep == 0 and self.step_count > 0:
-            self.clear_memory()
-        if self.hidden is None:
-            p_self = p_other = START
-        elif (previous := observation.get("previous_joint_action")) is not None:
-            p_self, p_other = int(previous[seat]), int(previous[1 - seat])
-        else:
-            p_self, p_other = self.last_action, self.partner_action_from_grids(self.last_grid, grid)
+        previous = observation["previous_joint_action"]
+        if timestep == 0:
+            self.hidden = None
+        p_self, p_other = (START, START) if previous is None else (int(previous[seat]), int(previous[1 - seat]))
 
         def scalar(value, dtype=torch.float32):
             return torch.tensor([[value]], dtype=dtype)
 
         with torch.inference_mode():
-            logits, p_logits, self.hidden, self.belief = self.models[layout](
-                torch.from_numpy(grid)[None, None], scalar(p_self, torch.long), scalar(p_other, torch.long),
-                scalar(float(seat)), scalar(1.0 - timestep / observation["horizon"]),
-                self.hidden, self.belief, self.prev_partner_logits,
+            logits, _, self.hidden = self.models[layout](
+                torch.from_numpy(np.asarray(observation["grid"], dtype=np.float32))[None, None],
+                scalar(p_self, torch.long), scalar(p_other, torch.long),
+                scalar(float(seat)), scalar(1.0 - timestep / observation["horizon"]), self.hidden,
             )
-        self.prev_partner_logits = p_logits[:, -1]
-        temperature = self.temperatures[layout]
-        if temperature <= 0:
-            action = int(logits[0, 0].argmax())
-        else:
-            action = int(self.rng.choice(6, p=torch.softmax(logits[0, 0] / temperature, dim=-1).numpy()))
-        self.step_count = timestep + 1
-        self.last_action, self.last_grid = action, grid
-        return action
+        return int(logits[0, 0].argmax())

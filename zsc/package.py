@@ -1,9 +1,9 @@
-"""Build a submission from one trained directory per map (best.safetensors and selection.json, named after the map):
+"""Build a submission from one trained directory per map (`best.safetensors`, named after the map):
 
     python -m zsc.package runs/students/{unident_s_hard,counter_circuit,schelling} --output runs/submission
 
 Three fp32 maps take 17 MiB against the platform's 5 MiB, so every weight matrix is stored as int8 with one
-fp16 scale per output row and everything else as fp16, about 1.5 MiB per map.
+fp16 scale per output row and everything else as fp16, about 1.3 MiB per map.
 """
 
 from __future__ import annotations
@@ -39,12 +39,8 @@ def package(runs: list[Path], output: Path) -> Path:
     agent = output / "agent"
     agent.mkdir(parents=True)
     shutil.copy(ROOT / "zsc/policy.py", agent / "policy.py")
-    meta = {}
     for run in runs:
-        selection = json.loads((run / "selection.json").read_text())
-        meta[run.name] = {"eta": selection["best_eta"], "temperature": selection["best_temp"]}
         save_file(quantize(load_file(str(run / "best.safetensors"))), str(agent / f"{run.name}.safetensors"))
-    (agent / "meta.json").write_text(json.dumps(meta, indent=1) + "\n")
 
     zip_path = output / "submission.zip"
     export_policy(CONFIG, agent, zip_path)

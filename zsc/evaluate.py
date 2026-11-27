@@ -1,11 +1,11 @@
 """Score submission packages with partners in the course's own environment, in both seats, on fixed seeds.
 
     python -m zsc.evaluate runs/submission/agent  # teachers, dev split
-    python -m zsc.evaluate runs/submission/agent --partners classmates --layouts counter_circuit
+    python -m zsc.evaluate runs/submission/agent --partners teachers scripted --layouts counter_circuit
     python -m zsc.evaluate runs/submission/agent --split test --output test.csv
 
 Each package runs through its own policy.py. `teachers` are the course's FCP/MEP members of the split (best and
-final stages) run through the course's FrozenPartner; `classmates` are the split's snapshots in runs/classmates.
+final stages) run through the course's FrozenPartner; `scripted` are the rule-based partners in zsc.scripted.
 The test split is for final reports only, never for choosing between models.
 """
 
@@ -25,12 +25,10 @@ import numpy as np
 import torch
 
 from core.actions import Action
-from core.catalog import get_map
 from core.env import policy_observation, read_scenarios
 from core.scenario import encode_observations
 from zsc import CONFIG, MAPS
-from zsc.classmates import DEFAULT_OUT as CLASSMATES
-from zsc.classmates import load_classmate
+from zsc.scripted import SCRIPTED_NAMES, make_scripted_partner
 from zsc.teachers import OFFICIAL as TEACHERS
 from zsc.teachers import split_of
 
@@ -62,12 +60,6 @@ def teacher_members(layout: str, split: str) -> list[str]:
     return names
 
 
-def classmate_members(layout: str, split: str) -> list[str]:
-    """Names `tpl_dense_3/s15M` of the split's classmate snapshots."""
-    manifest = json.loads((CLASSMATES / "manifest.json").read_text())
-    return [f"{e['style']}/{e['stage']}" for e in manifest if e["layout_id"] == layout and e["split"] == split]
-
-
 def teacher(name: str, spec, seed: int):
     algorithm, member_seed, stage = name.split("-")
     folder = TEACHERS / algorithm
@@ -80,23 +72,6 @@ def teacher(name: str, spec, seed: int):
     return partner.act
 
 
-def classmate(name: str, spec, seed: int):
-    style, stage = name.split("/")
-    entry = next(e for e in json.loads((CLASSMATES / "manifest.json").read_text())
-                 if e["layout_id"] == spec.layout_id and e["style"] == style and e["stage"] == stage)
-    grid = get_map(spec.layout_id)["grid"]
-    net = load_classmate(entry, CLASSMATES, len(grid), len(grid[0]), torch.device("cpu"))
-    generator = torch.Generator().manual_seed(seed)
-
-    @torch.inference_mode()
-    def act(grid):
-        logits = net(torch.as_tensor(grid).unsqueeze(0))
-        logits = logits[0] if isinstance(logits, tuple) else logits
-        return int(torch.multinomial(logits.softmax(-1), 1, generator=generator))
-
-    return act
-
-
 def play(job: tuple) -> dict:
     """One episode of the agent in `seat` with the partner in the other seat; returns the team score."""
     agent, layout, kind, name, seat, seed = job
@@ -104,7 +79,8 @@ def play(job: tuple) -> dict:
     mdp = spec.create_mdp()
     policy = load_module(Path(agent) / "policy.py").Policy(agent)
     policy.reset(seed=2 * seed + seat, player_index=seat, layout_id=layout, scenario_spec_id=spec.fingerprint)
-    partner = (teacher if kind == "teachers" else classmate)(name, spec, 2 * seed + 1 - seat)
+    partner = (teacher(name, spec, 2 * seed + 1 - seat) if kind == "teachers"
+               else make_scripted_partner(layout, name, seed=2 * seed + 1 - seat))
     state, previous, score = mdp.get_standard_start_state(), None, 0
     while state.timestep < spec.horizon:
         grids = encode_observations(mdp, state, spec.horizon)
@@ -122,12 +98,12 @@ def main() -> None:
     parser.add_argument("agents", nargs="+", help="package directories holding policy.py")
     parser.add_argument("--split", choices=SEEDS, default="dev")
     parser.add_argument("--layouts", nargs="+", choices=MAPS, default=MAPS)
-    parser.add_argument("--partners", nargs="+", choices=("teachers", "classmates"), default=["teachers"])
+    parser.add_argument("--partners", nargs="+", choices=("teachers", "scripted"), default=["teachers"])
     parser.add_argument("--workers", type=int, default=12)
     parser.add_argument("--output", type=Path, help="CSV with one row per episode")
     args = parser.parse_args()
 
-    members = {"teachers": teacher_members, "classmates": classmate_members}
+    members = {"teachers": teacher_members, "scripted": lambda *_: list(SCRIPTED_NAMES)}
     jobs = [(agent, layout, kind, name, seat, seed)
             for agent, layout, kind in product(args.agents, args.layouts, args.partners)
             for name, seat, seed in product(members[kind](layout, args.split), (0, 1), SEEDS[args.split])]
@@ -144,7 +120,7 @@ def main() -> None:
         groups[row["agent"], row["layout"], row["kind"], row["seat"]].append(row["score"])
     print(f"{'agent':40}{'layout':17}{'partners':11}{'mean':>7}{'seat0':>7}{'seat1':>7}")
     for agent, layout, kind in product(args.agents, args.layouts, args.partners):
-        if not groups[agent, layout, kind, 0]:  # e.g. no classmates for this map
+        if not groups[agent, layout, kind, 0]:
             continue
         seats = [np.mean(groups[agent, layout, kind, seat]) for seat in (0, 1)]
         print(f"{agent[-39:]:40}{layout:17}{kind:11}{np.mean(seats):7.1f}{seats[0]:7.1f}{seats[1]:7.1f}")
